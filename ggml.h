@@ -415,6 +415,8 @@ extern "C" {
         GGML_OP_AXPY,
         GGML_OP_OUT_PROD,
 
+        GGML_OP_FFN_SPARSE,
+
         GGML_OP_SCALE,
         GGML_OP_SET,
         GGML_OP_CPY,
@@ -1110,6 +1112,18 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * sparse_idx,
             struct ggml_tensor  * hybrid_aux);
+
+    GGML_API struct ggml_tensor *ggml_ffn_sparse(
+            struct ggml_context *ctx,
+            struct ggml_tensor  * input,
+            struct ggml_tensor  * gate_w,
+            struct ggml_tensor  * gate_b,
+            struct ggml_tensor  * up_w,
+            struct ggml_tensor  * up_b,
+            struct ggml_tensor  * down_w,
+            struct ggml_tensor  * down_b,
+            struct ggml_tensor  * idx,
+            int                   ffn_gate_type);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

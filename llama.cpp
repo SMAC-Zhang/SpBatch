@@ -398,6 +398,8 @@ enum llm_tensor {
     LLM_TENSOR_MLP_PRED_FC1,
     LLM_TENSOR_MLP_PRED_FC2,
     LLM_TENSOR_FFN_DOWN_T,
+    LLM_TENSOR_FFN_UP_BIAS,
+    LLM_TENSOR_FFN_DOWN_BIAS,
 };
 
 static std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NAMES = {
@@ -503,6 +505,8 @@ static std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NAMES = 
             {LLM_TENSOR_FFN_UP,          "blk.%d.ffn_up"},
             { LLM_TENSOR_MLP_PRED_FC1,    "blk.%d.fc1" },
             { LLM_TENSOR_MLP_PRED_FC2,    "blk.%d.fc2" },
+            { LLM_TENSOR_FFN_UP_BIAS,        "blk.%d.ffn_up" },
+            { LLM_TENSOR_FFN_DOWN_BIAS,        "blk.%d.ffn_down_t" },
         },
     },
     {
@@ -666,7 +670,7 @@ tensor_offloading_levels get_offloading_level(llm_tensor tensor) {
         case LLM_TENSOR_FFN_GATE: case LLM_TENSOR_FFN_DOWN: case LLM_TENSOR_FFN_UP:
         case LLM_TENSOR_FFN_DOWN_T:
             return TENSOR_OFFLOAD_FFN;
-        case LLM_TENSOR_FFN_NORM:
+        case LLM_TENSOR_FFN_NORM: case LLM_TENSOR_FFN_UP_BIAS: case LLM_TENSOR_FFN_DOWN_BIAS:
             return TENSOR_OFFLOAD_FFN_IO;
         case LLM_TENSOR_MLP_PRED_FC1: case LLM_TENSOR_MLP_PRED_FC2:
             return TENSOR_OFFLOAD_MLP_PRED;
@@ -3300,13 +3304,13 @@ static void llm_load_sparse_model_tensors(
                         layer.ffn_norm_b = create_tensor(tn(LLM_TENSOR_FFN_NORM, "bias", i), {n_embd});
 
                         layer.ffn_down_t = create_tensor(tn(LLM_TENSOR_FFN_DOWN_T, "weight", i), {n_embd, n_ff});
-                        layer.ffn_down_b = create_tensor(tn(LLM_TENSOR_FFN_DOWN_T, "bias", i), {n_embd}); 
+                        layer.ffn_down_b = create_tensor(tn(LLM_TENSOR_FFN_DOWN_BIAS, "bias", i), {n_embd}); 
 
                         layer.mlp_pre_w1 = create_tensor(tn(LLM_TENSOR_MLP_PRED_FC1, "weight", i), {n_embd, GGML_NE_WILDCARD});
                         layer.mlp_pre_w2 = create_tensor(tn(LLM_TENSOR_MLP_PRED_FC2, "weight", i), {GGML_NE_WILDCARD, n_ff});
 
                         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff});
-                        layer.ffn_up_b = create_tensor(tn(LLM_TENSOR_FFN_UP,   "bias", i), {n_ff});
+                        layer.ffn_up_b = create_tensor(tn(LLM_TENSOR_FFN_UP_BIAS,   "bias", i), {n_ff});
                     }
                 } break;
             case LLM_ARCH_FALCON:
@@ -4411,9 +4415,10 @@ static std::pair<ggml_tensor*, ggml_tensor*> llm_build_kv_store(
     // important: storing RoPE-ed version of K in the KV cache!
     ggml_tensor * k_cpy = ggml_cpy(ctx, k_cur,   k_cache_view);
     ggml_tensor * v_cpy = ggml_cpy(ctx, v_cur_t, v_cache_view);
-    //ggml_build_forward_expand(graph, ggml_cpy(ctx, k_cur,   k_cache_view));
-    //ggml_build_forward_expand(graph, ggml_cpy(ctx, v_cur_t, v_cache_view));
+    // ggml_build_forward_expand(graph, ggml_cpy(ctx, k_cur,   k_cache_view));
+    // ggml_build_forward_expand(graph, ggml_cpy(ctx, v_cur_t, v_cache_view));
     
+    // return {0, 0};
     return {k_cpy, v_cpy};
 }
 
@@ -4706,6 +4711,12 @@ static struct ggml_tensor * llm_build_ffn_sparse(
         }
         return tensor;
     };
+
+    if (full_gpu && idx->ne[1] % 8 == 0) {
+        cur = ggml_ffn_sparse(ctx, cur, gate, gate_b, up, up_b, down_t, down_b, idx, type_gate);
+        cb(cur, "ffn_sparse_full_gpu");
+        return cur;
+    }
 
     // FFN up
     struct ggml_tensor * up_out = llm_build_sparse_mul_mat(ctx, up, ffn_input, idx, up_gpu, gpu_index, gpu_bucket, cb_outer, "up", full_gpu);
@@ -5000,14 +5011,14 @@ struct llm_build_context {
                     n_embd_head, 0, 0, n_orig_ctx, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
-                cb(Qcur, "Qcur", il);
+                cb(Qcur, "Qcur-rope", il);
 
                 Kcur = ggml_rope_custom(
                     ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos,
                     n_embd_head, 0, 0, n_orig_ctx, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
-                cb(Kcur, "Kcur", il);
+                cb(Kcur, "Kcur-rope", il);
 
                 std::tie(k_cpy, v_cpy) = llm_build_kv_store(ctx0, hparams, kv_self, gf, Kcur, Vcur, n_ctx, n_tokens, kv_head, cb, il);
 
@@ -6358,6 +6369,8 @@ static const std::unordered_map<const char *, llm_offload_func_e> k_offload_map 
     { "Kcur",                       OFFLOAD_FUNC_KQ  },
     { "Qcur",                       OFFLOAD_FUNC_KQ  },
     { "Vcur",                       OFFLOAD_FUNC_V   },
+    { "Qcur-rope",                  OFFLOAD_FUNC_KQ  },
+    { "Kcur-rope",                  OFFLOAD_FUNC_KQ  },
 
     { "krot",                       OFFLOAD_FUNC_KQ  },
     { "qrot",                       OFFLOAD_FUNC_KQ  },
@@ -6780,6 +6793,7 @@ static int llama_decode_internal(
     GGML_ASSERT(n_tokens <= n_batch);
 
     int n_threads = n_tokens == 1 ? cparams.n_threads : cparams.n_threads_batch;
+    n_threads = 1;
     GGML_ASSERT((!batch.token && batch.embd) || (batch.token && !batch.embd)); // NOLINT
 
     const int64_t t_start_us = ggml_time_us();

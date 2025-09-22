@@ -4189,6 +4189,50 @@ struct ggml_tensor * ggml_axpy(
     return result;
 }
 
+struct ggml_tensor * ggml_ffn_sparse(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,
+    struct ggml_tensor * gate_w,
+    struct ggml_tensor * gate_b,
+    struct ggml_tensor * up_w,
+    struct ggml_tensor * up_b,
+    struct ggml_tensor * down_w,
+    struct ggml_tensor * down_b,
+    struct ggml_tensor * idx,
+    int                  ffn_gate_type
+) {
+    // GGML_ASSERT(input != NULL && idx != NULL && gate_w != NULL && up_w != NULL && down_w != NULL);
+    bool is_node = false;
+
+    const int64_t ne[4] = {input->ne[0], input->ne[1], input->ne[2], input->ne[3]};
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, input->n_dims, ne);
+
+    result->op = GGML_OP_FFN_SPARSE;
+    result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
+    if (ffn_gate_type == 0) {
+        result->src[0] = up_w;
+        result->src[1] = input;
+        result->src[2] = up_b;
+        result->src[3] = down_w;
+        result->src[4] = down_b;
+        result->src[5] = idx;
+    } else if (ffn_gate_type == 1 || ffn_gate_type == 2) {
+        result->src[0] = gate_w;
+        result->src[1] = input;
+        result->src[2] = up_w;
+        result->src[3] = down_w;
+        result->src[4] = idx;
+    } else {
+        GGML_ASSERT(false && "unsupported ffn_gate_type");
+    }
+
+    int32_t params[] = { ffn_gate_type + 1 };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    (void)gate_b;
+    return result;
+}
+
 // ggml_out_prod
 
 struct ggml_tensor * ggml_out_prod(
@@ -14793,6 +14837,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     if (skip_cpu) {
         return;
     }
+
+    // printf("WARNING: running operator %s on CPU, this is safe but slow\n", ggml_get_name(tensor));
     // Make sure src[0] (weight for binary ops) is on CPU to avoid any weight transfer
     GGML_ASSERT((tensor->src[0] == NULL || tensor->src[0]->backend == GGML_BACKEND_CPU) && "weight should be on the CPU to compute on the CPU");
 #endif // GGML_USE_CUBLAS
@@ -14926,6 +14972,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                     ggml_compute_forward_mul_mat_axpy_head(params, tensor->src[0], tensor->src[1], tensor);
                 }
                 // ggml_compute_forward_mul_mat_axpy(params, tensor->src[0], tensor->src[1], tensor);
+            } break;
+        case GGML_OP_FFN_SPARSE:
+            {
+                GGML_ASSERT(false && "not implemented on CPU: FFN_SPARSE");
             } break;
         case GGML_OP_OUT_PROD:
             {
@@ -16706,6 +16756,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 }
 #endif
             } break;
+        case GGML_OP_FFN_SPARSE:
         case GGML_OP_MUL_MAT_SPARSE:
         case GGML_OP_AXPY:
             {

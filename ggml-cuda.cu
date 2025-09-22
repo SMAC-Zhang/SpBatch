@@ -80,6 +80,8 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <cub/cub.cuh>
+#include <mma.h>
 #endif // defined(GGML_USE_HIPBLAS)
 
 #include "ggml-cuda.h"
@@ -7659,6 +7661,898 @@ inline void ggml_cuda_op_dequantize_axpy(
     (void) src1_padded_row_size;
 }
 
+/*************************** Sparse matrix multiplication related ***************************/
+// Sparse division related
+#define CUDA_RELU_MUL_BLOCK_SIZE 256
+#define SPARSITY_GROUP_SIZE 8
+#define MAX_GROUPS 64
+
+// WMMA API parameters
+#define MMA_M 16
+#define MMA_N 8
+#define MMA_K 16
+
+#define SWIZZLE_UNIT 8
+#define HALF_PER_FLOAT4 8
+
+// ROW_WARPS * WARP_ROW_TENSORS must be multiple of 4
+template<int ROW_WARPS_, int COL_WARPS_, int WARP_ROW_TENSORS_, int WARP_COL_TENSORS_, int BLOCK_K_TENSORS_>
+struct SparseMMConfig {
+    // block size
+    static constexpr int ROW_WARPS = ROW_WARPS_;
+    static constexpr int COL_WARPS = COL_WARPS_;
+    static constexpr int BLOCK_WARPS = ROW_WARPS * COL_WARPS;
+
+    static constexpr int WARP_ROW_TENSORS = WARP_ROW_TENSORS_;
+    static constexpr int WARP_COL_TENSORS = WARP_COL_TENSORS_;
+    static constexpr int BLOCK_K_TENSORS = BLOCK_K_TENSORS_; // multiple of 4
+
+    // double buffer shared memory size
+    // 2 * BM * BK * sizeof(half) + 2 * BN * BK * sizeof(half)
+    static constexpr int BM = MMA_M * ROW_WARPS * WARP_ROW_TENSORS;
+    static constexpr int BN = MMA_N * COL_WARPS * WARP_COL_TENSORS;
+    static constexpr int BK = MMA_K * BLOCK_K_TENSORS;
+};
+
+/*************************** PTX instructions ***************************/
+static __device__ __forceinline__ void CP_ASYNC_16(void* smem_ptr, const void* global_ptr, bool pred_guard = true) {
+    unsigned smem_int_ptr = __cvta_generic_to_shared(smem_ptr);
+    asm volatile("{ \n"
+                 "  .reg .pred p;\n"
+                 "  setp.ne.b32 p, %0, 0;\n"
+                 "  @p cp.async.cg.shared.global [%1], [%2], 16;\n"
+                 "}\n" ::"r"((int)pred_guard),
+                 "r"(smem_int_ptr),
+                 "l"(global_ptr));
+}
+
+static __device__ __forceinline__ void RESET_ASYNC_16(void* smem_ptr, const void* global_ptr) {
+    unsigned smem_int_ptr = __cvta_generic_to_shared(smem_ptr);
+    asm volatile("{ \n"
+                 "  cp.async.cg.shared.global [%0], [%1], 16, 0;\n"
+                 "}\n" :: "r"(smem_int_ptr),
+                 "l"(global_ptr));
+}
+
+static __device__ __forceinline__ void MMA_FP16_M16N8K16(uint32_t * __restrict__ a, uint32_t * __restrict__ b, uint32_t * __restrict__ c) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
+                 "{ %0, %1, %2, %3 },"
+                 "{ %4, %5, %6, %7 },"
+                 "{ %8, %9 },"
+                 "{ %10, %11, %12, %13 };"
+                 : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
+                 :  "r"(a[0]),  "r"(a[1]),  "r"(a[2]),  "r"(a[3]), 
+                    "r"(b[0]),  "r"(b[1]), 
+                    "r"(c[0]),  "r"(c[1]), "r"(c[2]),  "r"(c[3]));
+}
+
+template<class MMconfig>
+static __device__ __forceinline__ void LD_SPARSE_UP_TILE_TO_SHARED( half* __restrict__ s_a, const half* __restrict__ a, const int LDA, const int * merge_idx, int start_row, int actM,
+                                                                    half* __restrict__ s_b, const half* __restrict__ b, const int LDB) {
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int load_k_iter = MMconfig::BK / (SWIZZLE_UNIT * SWIZZLE_UNIT);
+    
+    { // load A_TILE
+        int col = lane_id % SWIZZLE_UNIT;
+        int row1 = lane_id / SWIZZLE_UNIT;
+        int row2 = row1 + 4;
+        int s_col1 = col ^ row1;
+        int s_col2 = col ^ row2;
+
+        const int copy_units = MMconfig::BM / SWIZZLE_UNIT;
+        const int load_iter = (copy_units - 1)  / MMconfig::BLOCK_WARPS + 1;
+        
+        #pragma unroll
+        for (int i = 0; i < load_k_iter; ++i) {
+            int unit_id = warp_id;
+            #pragma unroll
+            for (int j = 0; j < load_iter; ++j) {
+                bool pred = (unit_id < copy_units);
+                half * __restrict__ s_local_a = s_a + unit_id * SWIZZLE_UNIT * MMconfig::BK;
+                const int a_row = unit_id * SWIZZLE_UNIT + start_row;
+                pred = pred && (a_row + row1 < actM);
+                CP_ASYNC_16(s_local_a + row1 * MMconfig::BK + s_col1 * SWIZZLE_UNIT, 
+                            a + merge_idx[a_row + row1] * LDA + col * SWIZZLE_UNIT,        
+                            pred);
+                pred = pred && (a_row + row2 < actM);
+                CP_ASYNC_16(s_local_a + row2 * MMconfig::BK + s_col2 * SWIZZLE_UNIT, 
+                            a + merge_idx[a_row + row2] * LDA + col * SWIZZLE_UNIT,        
+                            pred);
+                unit_id += MMconfig::BLOCK_WARPS;
+            }
+            s_a += (SWIZZLE_UNIT * SWIZZLE_UNIT);
+            a += (SWIZZLE_UNIT * SWIZZLE_UNIT);
+        }
+    }
+
+    { // load B_TILE
+        int row = lane_id % SWIZZLE_UNIT;
+        int col1 = lane_id / SWIZZLE_UNIT;
+        int col2 = col1 + 4;
+        int s_row1 = row ^ col1;
+        int s_row2 = row ^ col2;
+
+        const int copy_units = MMconfig::BN / SWIZZLE_UNIT;
+        const int load_iter = (copy_units - 1)  / MMconfig::BLOCK_WARPS + 1;
+        
+        #pragma unroll
+        for (int i = 0; i < load_k_iter; ++i) {
+            int unit_id = warp_id;
+            #pragma unroll
+            for (int j = 0; j < load_iter; ++j) {
+                bool pred = (unit_id < copy_units);
+                half * __restrict__ s_local_b = s_b + unit_id * SWIZZLE_UNIT * MMconfig::BK;
+                const half * __restrict__ local_b = b + unit_id * SWIZZLE_UNIT * LDB;
+                CP_ASYNC_16(s_local_b + col1 * MMconfig::BK + s_row1 * SWIZZLE_UNIT, 
+                            local_b + col1 * LDB + row * SWIZZLE_UNIT,        
+                            pred);
+                CP_ASYNC_16(s_local_b + col2 * MMconfig::BK + s_row2 * SWIZZLE_UNIT, 
+                            local_b + col2 * LDB + row * SWIZZLE_UNIT,        
+                            pred);
+                unit_id += MMconfig::BLOCK_WARPS;
+            }
+            s_b += (SWIZZLE_UNIT * SWIZZLE_UNIT);
+            b += (SWIZZLE_UNIT * SWIZZLE_UNIT);
+        }
+    }
+}
+
+template<class MMconfig, int slda, int sldb>
+static __device__ __forceinline__ void LD_SPARSE_DOWN_TILE_TO_SHARED(half* __restrict__ s_a, const half* __restrict__ a, const int LDA, const int * merge_idx, int start_k, int actK,
+                                                                     half* __restrict__ s_b, const half* __restrict__ b, const int LDB) {
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    { // init A_TILE to 0
+        int size_per_warp = (MMconfig::BM * MMconfig::BK) / MMconfig::BLOCK_WARPS;
+        int iter = size_per_warp / WARP_SIZE / HALF_PER_FLOAT4;
+        half* start_ptr = s_a + warp_id * size_per_warp + lane_id * HALF_PER_FLOAT4;
+        #pragma unroll
+        for (int i = 0; i < iter; ++i) {
+            RESET_ASYNC_16(start_ptr, nullptr);
+            start_ptr += WARP_SIZE * HALF_PER_FLOAT4;
+        }
+    }
+
+    asm volatile("cp.async.wait_all;\n");
+
+    { // load A_TILE
+        int load_m_iter = MMconfig::BM / (SWIZZLE_UNIT * SWIZZLE_UNIT);
+        int row = lane_id % SWIZZLE_UNIT;
+        int col1 = lane_id / SWIZZLE_UNIT;
+        int col2 = col1 + 4;
+        int s_row1 = row ^ col1;
+        int s_row2 = row ^ col2;
+
+        const int copy_units = MMconfig::BK / SWIZZLE_UNIT;
+        const int load_iter = (copy_units - 1)  / MMconfig::BLOCK_WARPS + 1;
+        
+        #pragma unroll
+        for (int i = 0; i < load_m_iter; ++i) {
+            int unit_id = warp_id;
+            #pragma unroll
+            for (int j = 0; j < load_iter; ++j) {
+                bool pred = (unit_id < copy_units);
+                half * __restrict__ s_local_a = s_a + unit_id * SWIZZLE_UNIT * slda;
+                const int a_col = unit_id * SWIZZLE_UNIT + start_k;
+                pred = pred && (a_col + col1 < actK);
+                CP_ASYNC_16(s_local_a + col1 * slda + s_row1 * SWIZZLE_UNIT, 
+                            a + merge_idx[a_col + col1] * LDA + row * SWIZZLE_UNIT,        
+                            pred);
+                pred = pred && (a_col + col2 < actK);
+                CP_ASYNC_16(s_local_a + col2 * slda + s_row2 * SWIZZLE_UNIT, 
+                            a + merge_idx[a_col + col2] * LDA + row * SWIZZLE_UNIT,        
+                            pred);
+                unit_id += MMconfig::BLOCK_WARPS;
+            }
+            s_a += (SWIZZLE_UNIT * SWIZZLE_UNIT);
+            a += (SWIZZLE_UNIT * SWIZZLE_UNIT);
+        }
+    }
+
+    { // load B_TILE
+        int load_k_iter = MMconfig::BK / (SWIZZLE_UNIT * SWIZZLE_UNIT);
+        int row = lane_id % SWIZZLE_UNIT;
+        int col1 = lane_id / SWIZZLE_UNIT;
+        int col2 = col1 + 4;
+        int s_row1 = row ^ col1;
+        int s_row2 = row ^ col2;
+
+        const int copy_units = MMconfig::BN / SWIZZLE_UNIT;
+        const int load_iter = (copy_units - 1)  / MMconfig::BLOCK_WARPS + 1;
+
+        #pragma unroll
+        for (int i = 0; i < load_k_iter; ++i) {
+            int unit_id = warp_id;
+            #pragma unroll
+            for (int j = 0; j < load_iter; ++j) {
+                bool pred = (unit_id < copy_units);
+                half * __restrict__ s_local_b = s_b + unit_id * SWIZZLE_UNIT * sldb;
+                const half * __restrict__ local_b = b + unit_id * SWIZZLE_UNIT * LDB;
+                CP_ASYNC_16(s_local_b + col1 * sldb + s_row1 * SWIZZLE_UNIT, 
+                            local_b + col1 * LDB + row * SWIZZLE_UNIT,        
+                            pred);
+                CP_ASYNC_16(s_local_b + col2 * sldb + s_row2 * SWIZZLE_UNIT, 
+                            local_b + col2 * LDB + row * SWIZZLE_UNIT,        
+                            pred);
+                unit_id += MMconfig::BLOCK_WARPS;
+            }
+            s_b += (SWIZZLE_UNIT * SWIZZLE_UNIT);
+            b += (SWIZZLE_UNIT * SWIZZLE_UNIT);
+        }
+    }
+}
+
+template<int NumOfTensors, int slda>
+static __device__ __forceinline__ void LD_ROW_FRAG_X4(uint32_t (* __restrict__ reg)[4], const half* __restrict__ smem_ptr, const int warp_start_row, const int wk) {
+    int lane_id = threadIdx.x % 32;
+    int row = lane_id % MMA_M;
+    int col = lane_id / MMA_M;
+    
+    smem_ptr += (warp_start_row + row) * slda + (wk + col * SWIZZLE_UNIT);
+    uint32_t smem_local_ptr = __cvta_generic_to_shared(smem_ptr);
+    smem_local_ptr = smem_local_ptr ^ ((row % SWIZZLE_UNIT) * SWIZZLE_UNIT * sizeof(half)); // eliminate bank conflict
+    
+    #pragma unroll
+    for (int i = 0; i < NumOfTensors; ++i) {
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                        : "=r"(reg[i][0]), "=r"(reg[i][1]), "=r"(reg[i][2]), "=r"(reg[i][3])
+                        : "r"(smem_local_ptr));
+        smem_local_ptr += slda * MMA_M * sizeof(half);
+    }
+}
+
+template<int NumOfTensors, int slda>
+static __device__ __forceinline__ void LD_COL_FRAG_X4(uint32_t (* __restrict__ reg)[4], const half* __restrict__ smem_ptr, const int warp_start_row, const int wk) {
+    int lane_id = threadIdx.x % 32;
+    int row = lane_id / 8 % 2;
+    int col = lane_id / 16 * 8 + lane_id % 8;
+    
+    smem_ptr += warp_start_row + row * SWIZZLE_UNIT + (wk + col) * slda;
+    uint32_t smem_local_ptr = __cvta_generic_to_shared(smem_ptr);
+    // smem_local_ptr = smem_local_ptr ^ ((col % SWIZZLE_UNIT) * SWIZZLE_UNIT * sizeof(half)); // eliminate bank conflict
+    uint32_t bank_conflict_offset = (col % SWIZZLE_UNIT) * SWIZZLE_UNIT * sizeof(half);
+    
+    #pragma unroll
+    for (int i = 0; i < NumOfTensors; ++i) {
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                        : "=r"(reg[i][0]), "=r"(reg[i][1]), "=r"(reg[i][2]), "=r"(reg[i][3])
+                        : "r"(smem_local_ptr ^ bank_conflict_offset));
+        smem_local_ptr += MMA_M * sizeof(half);
+    }
+}
+
+template<int NumOfTensors, int slda>
+static __device__ __forceinline__ void LD_COL_FRAG_X2(uint32_t (* __restrict__ reg) [2], const half* __restrict__ smem_ptr, const int warp_start_col, const int wk) {
+    int lane_id = threadIdx.x % 32;
+    int col = lane_id % 8;
+    int row = lane_id / 8;
+    
+    smem_ptr += (warp_start_col + col) * slda + (wk + row * SWIZZLE_UNIT);
+    uint32_t smem_local_ptr = __cvta_generic_to_shared(smem_ptr);
+    smem_local_ptr = smem_local_ptr ^ ((col % SWIZZLE_UNIT) * SWIZZLE_UNIT * sizeof(half)); // eliminate bank conflict
+
+    #pragma unroll
+    for (int i = 0; i < NumOfTensors; ++i) {
+        asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                        : "=r"(reg[i][0]), "=r"(reg[i][1])
+                        : "r"(smem_local_ptr));
+        smem_local_ptr += slda * MMA_N * sizeof(half);
+    }
+}
+
+/*************************** cuda kernels ***************************/
+static __global__ void relu_and_mul_f32(const float * x, const float * y, float * dst, const int M, const int N) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= M * N) {
+        return;
+    }
+    dst[i] = fmaxf(x[i], 0) * y[i];
+}
+
+static __global__ void relu_relu_mul_f32(const float * x, const float * y, float * dst, const int M, const int N) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= M * N) {
+        return;
+    }
+    dst[i] = fmaxf(x[i], 0) * fmaxf(y[i], 0);
+}
+
+static __global__ void merge_batch_sparsity_kernel(const float * __restrict__ x, uint32_t * __restrict__ bits, uint32_t * __restrict__ prefix, const int batch_size, const int N, const int groups) {
+    const int pos = blockIdx.x * blockDim.x + threadIdx.x;
+    const int wid = pos / WARP_SIZE;
+    const int lane = pos % WARP_SIZE;
+    const int len = N / WARP_SIZE;
+
+    if (pos >= N) {
+        return;
+    }
+
+    int pred[MAX_GROUPS] = {0};
+    #pragma unroll
+    for (int i = 0; i < batch_size; ++i) {
+        pred[i / SPARSITY_GROUP_SIZE] += (x[i * N + pos] > 0);
+    }
+
+    #pragma unroll
+    for (int i = 0; i < groups; ++i) {
+        bits[i * len + wid] = __ballot_sync(0xFFFFFFFF, pred[i]);
+    }
+    if (lane < groups) {
+        const int bits_pos = lane * len + wid;
+        prefix[bits_pos] = __popc(bits[bits_pos]);
+    }
+}
+
+// return: indics: [groups * neurons]
+static __global__ void generate_indices_kernel(const uint32_t* __restrict__ bits, const uint32_t* __restrict__ prefix, int* __restrict__ indices, const int total_bits, const int groups) {
+    const int pos = blockIdx.x * blockDim.x + threadIdx.x;
+    const int len = total_bits / groups;
+    const int group_id = pos / len;
+    const int neurons = len * WARP_SIZE;
+    const int base_idx = pos * WARP_SIZE - group_id * neurons;
+
+    if (pos >= total_bits) {
+        return;
+    }
+
+    int output_pos = (pos == 0 ? 0 : prefix[pos - 1]) - (group_id == 0 ? 0 : prefix[group_id * len - 1]);
+
+    uint32_t word = bits[pos];
+    while (word) {
+        int bit_pos = __ffs(word) - 1;
+        
+        indices[group_id * neurons + output_pos] = base_idx + bit_pos;
+        output_pos++;
+        word &= ~(1U << bit_pos);
+    }
+}
+
+static __global__ void move_activation(const uint32_t* __restrict__ prefix, int* __restrict__ act_neurons_device, const int len) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    act_neurons_device[tid] = prefix[(tid + 1) * len - 1];
+}
+
+template<class MMConfig>
+static __global__ void mm_up(const half * __restrict__ a, const half * __restrict__ b, float * __restrict__ c, const int M, const int N, const int K, const int * act_neurons, const int * merge_idx) {
+    using namespace nvcuda;
+
+    const int BM = MMConfig::BM;
+    const int BN = MMConfig::BN;
+    const int BK = MMConfig::BK;
+    
+    const int WARP_ROW_TENSORS = MMConfig::WARP_ROW_TENSORS;
+    const int WARP_COL_TENSORS = MMConfig::WARP_COL_TENSORS;
+    const int BLOCK_K_TENSORS = MMConfig::BLOCK_K_TENSORS;
+
+    const int bx = blockIdx.x;
+    const int by = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int wid = tid / WARP_SIZE;
+    const int wrid = wid / MMConfig::COL_WARPS;
+    const int wcid = wid % MMConfig::COL_WARPS;
+    const int lane_id = tid % WARP_SIZE;
+
+    const int LDA = K;
+    const int LDB = K;
+    const int LDC = M;
+    const int actM = (bx == 0) ? act_neurons[0] : (act_neurons[bx] - act_neurons[bx - 1]);
+
+    const int start_row = by * BM;
+    const int start_col = bx * BN;
+    if (start_row >= actM || start_col >= N) {
+        return;
+    }
+
+    const int warp_start_row = wrid * WARP_ROW_TENSORS * MMA_M;
+    const int warp_start_col = wcid * WARP_COL_TENSORS * MMA_N;
+
+    extern __shared__  __align__(128) char shared_mem[];
+    half *s_a1 = (half *)shared_mem;
+    half *s_a2 = (half *)&s_a1[BM * BK];
+    half *s_b1 = (half *)&s_a2[BM * BK];
+    half *s_b2 = (half *)&s_b1[BN * BK];
+    merge_idx = merge_idx + bx * M;
+
+    const int slda = BK;
+    const int sldb = BK;
+
+    uint32_t a_reg[2][WARP_ROW_TENSORS][4] = { 0 };
+    uint32_t b_reg[2][WARP_COL_TENSORS][2] = { 0 };
+    float c_reg[WARP_ROW_TENSORS][WARP_COL_TENSORS][4] = { 0.0f };
+
+    #pragma unroll
+    for (int sk = 0; ; sk += BK) {
+        if (sk < K) {
+            // load tile to shared memory
+            LD_SPARSE_UP_TILE_TO_SHARED<MMConfig>
+            (s_a2, a + sk, LDA, merge_idx, start_row, actM, s_b2, b + start_col * LDB + sk, LDB);
+            asm volatile("cp.async.commit_group;\n" ::);
+        }
+
+        if (sk > 0) {
+            // load frag from shared memory to registers
+            LD_ROW_FRAG_X4<WARP_ROW_TENSORS, slda>(a_reg[0], s_a1, warp_start_row, 0);
+            LD_COL_FRAG_X2<WARP_COL_TENSORS, sldb>(b_reg[0], s_b1, warp_start_col, 0);
+            #pragma unroll
+            for (int i = 0; i < BLOCK_K_TENSORS;) {
+                #pragma unroll
+                for (int j = 0; j < WARP_ROW_TENSORS; ++j) {
+                    #pragma unroll
+                    for (int k = 0; k < WARP_COL_TENSORS; ++k) {
+                        MMA_FP16_M16N8K16(a_reg[i % 2][j], b_reg[i % 2][k], (uint32_t*)c_reg[j][k]);
+                    }
+                }
+                i += 1;
+                if (i >= BLOCK_K_TENSORS) {
+                    break;
+                }
+                LD_ROW_FRAG_X4<WARP_ROW_TENSORS, slda>(a_reg[i % 2], s_a1, warp_start_row, i * MMA_K);
+                LD_COL_FRAG_X2<WARP_COL_TENSORS, sldb>(b_reg[i % 2], s_b1, warp_start_col, i * MMA_K);
+            }
+        }
+
+        if (sk >= K) {
+            break;
+        }
+        
+        // swap shared memory double buffer
+        asm volatile("cp.async.wait_group 0;\n" ::);
+        half* s_b = s_b1;
+        s_b1 = s_b2;
+        s_b2 = s_b;
+        half* s_a = s_a1;
+        s_a1 = s_a2;
+        s_a2 = s_a;
+        __syncthreads();
+    }
+    
+    // transpose and write back C
+    #pragma unroll
+    for (int i = 0; i < WARP_ROW_TENSORS; i++) {
+        #pragma unroll
+        for (int j = 0; j < WARP_COL_TENSORS; j++) {
+            int row = warp_start_row + i * MMA_M + lane_id / 4 + start_row;
+            int col = warp_start_col + j * MMA_N + lane_id % 4 * 2 + start_col;
+            c[(col + 0) * LDC + row] = c_reg[i][j][0];
+            c[(col + 0) * LDC + row + 8] = c_reg[i][j][2];
+            c[(col + 1) * LDC + row] = c_reg[i][j][1];
+            c[(col + 1) * LDC + row + 8] = c_reg[i][j][3];
+        }
+    }
+}
+
+template<class MMConfig>
+static __global__ void mm_down(const half * __restrict__ a, const half * __restrict__ b, float * __restrict__ c, const int M, const int N, const int K, const int * act_neurons, const int * merge_idx) {
+    using namespace nvcuda;
+
+    const int BM = MMConfig::BM;
+    const int BN = MMConfig::BN;
+    const int BK = MMConfig::BK;
+    
+    const int WARP_ROW_TENSORS = MMConfig::WARP_ROW_TENSORS;
+    const int WARP_COL_TENSORS = MMConfig::WARP_COL_TENSORS;
+    const int BLOCK_K_TENSORS = MMConfig::BLOCK_K_TENSORS;
+
+    const int bx = blockIdx.x;
+    const int by = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int wid = tid / WARP_SIZE;
+    const int wrid = wid / MMConfig::COL_WARPS;
+    const int wcid = wid % MMConfig::COL_WARPS;
+    const int lane_id = tid % WARP_SIZE;
+
+    const int LDA = M;
+    const int LDB = K;
+    const int LDC = M;
+    const int actK = (bx == 0) ? act_neurons[0] : (act_neurons[bx] - act_neurons[bx - 1]);
+
+    const int start_row = by * BM;
+    const int start_col = bx * BN;
+    if (start_row >= M || start_col >= N) {
+        return;
+    }
+
+    const int warp_start_row = wrid * WARP_ROW_TENSORS * MMA_M;
+    const int warp_start_col = wcid * WARP_COL_TENSORS * MMA_N;
+
+    extern __shared__  __align__(128) char shared_mem[];
+    half *s_a1 = (half *)shared_mem;
+    half *s_a2 = (half *)&s_a1[BM * BK];
+    half *s_b1 = (half *)&s_a2[BM * BK];
+    half *s_b2 = (half *)&s_b1[BN * BK];
+    merge_idx = merge_idx + bx * K;
+
+    const int slda = BM;
+    const int sldb = BK;
+
+    uint32_t a_reg[2][WARP_ROW_TENSORS][4] = { 0 };
+    uint32_t b_reg[2][WARP_COL_TENSORS][2] = { 0 };
+    float c_reg[WARP_ROW_TENSORS][WARP_COL_TENSORS][4] = {0.0f};
+
+    #pragma unroll
+    for (int sk = 0; ; sk += BK) {
+        if (sk < actK) {
+            // load tile to shared memory
+            LD_SPARSE_DOWN_TILE_TO_SHARED<MMConfig, slda, sldb>
+            (s_a2, a + start_row, LDA, merge_idx, sk, actK, s_b2, b + start_col * LDB + sk, LDB);
+            asm volatile("cp.async.commit_group;\n" ::);
+        }
+
+        if (sk > 0) {
+            // load frag from shared memory to registers
+            LD_COL_FRAG_X4<WARP_ROW_TENSORS, slda>(a_reg[0], s_a1, warp_start_row, 0);
+            LD_COL_FRAG_X2<WARP_COL_TENSORS, sldb>(b_reg[0], s_b1, warp_start_col, 0);
+            #pragma unroll
+            for (int i = 0; i < BLOCK_K_TENSORS;) {
+                #pragma unroll
+                for (int j = 0; j < WARP_ROW_TENSORS; ++j) {
+                    #pragma unroll
+                    for (int k = 0; k < WARP_COL_TENSORS; ++k) {
+                        MMA_FP16_M16N8K16(a_reg[i % 2][j], b_reg[i % 2][k], (uint32_t*)c_reg[j][k]);
+                    }
+                }
+                i += 1;
+                if (i >= BLOCK_K_TENSORS) {
+                    break;
+                }
+                LD_COL_FRAG_X4<WARP_ROW_TENSORS, slda>(a_reg[i % 2], s_a1, warp_start_row, i * MMA_K);
+                LD_COL_FRAG_X2<WARP_COL_TENSORS, sldb>(b_reg[i % 2], s_b1, warp_start_col, i * MMA_K);
+            }
+        }
+
+        if (sk >= actK) {
+            break;
+        }
+        
+        // swap shared memory double buffer
+        asm volatile("cp.async.wait_group 0;\n" ::);
+        half* s_b = s_b1;
+        s_b1 = s_b2;
+        s_b2 = s_b;
+        half* s_a = s_a1;
+        s_a1 = s_a2;
+        s_a2 = s_a;
+        __syncthreads();
+    }
+    
+    // transpose and write back C
+    #pragma unroll
+    for (int i = 0; i < WARP_ROW_TENSORS; i++) {
+        #pragma unroll
+        for (int j = 0; j < WARP_COL_TENSORS; j++) {
+            int row = warp_start_row + i * MMA_M + lane_id / 4 + start_row;
+            int col = warp_start_col + j * MMA_N + lane_id % 4 * 2 + start_col;
+            // printf("row: %d, col: %d\n", row, col);
+            c[(col + 0) * LDC + row] = c_reg[i][j][0];
+            c[(col + 0) * LDC + row + 8] = c_reg[i][j][2];
+            c[(col + 1) * LDC + row] = c_reg[i][j][1];
+            c[(col + 1) * LDC + row + 8] = c_reg[i][j][3];
+        }
+    }
+}
+
+static __global__ void add_f32_sparse(const float* __restrict__ a, const float * __restrict__ b, float * __restrict__ c, const int M, const int N, const int * act_neurons, const int * merge_idx) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int group_id = row / SPARSITY_GROUP_SIZE;
+
+    int actN = (group_id > 0) ? (act_neurons[group_id] - act_neurons[group_id - 1]) : act_neurons[group_id];
+    merge_idx = merge_idx + group_id * N;
+
+    if (row >= M || col >= actN) {
+        return;
+    }
+    c[row * N + col] = a[row * N + col] + b[merge_idx[col]];
+}
+
+static __global__ void add_f32_nosparse(const float* __restrict__ a, const float * __restrict__ b, float * __restrict__ c, const int M, const int N) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row >= M || col >= N) {
+        return;
+    }
+    c[row * N + col] = a[row * N + col] + b[col];
+}
+
+static __global__ void test_mem(const int * __restrict__ a, const int size) {
+    int tid = blockDim.x*blockIdx.x + threadIdx.x;
+    if (tid == 0) {
+        for (int i = 0; i < size; ++i) {
+            printf("a[%d]: %d\n", i, a[i]);
+        }
+    }
+}
+
+/******************************** wrapper functions for CUDA kernels *****************************/
+// parameters:
+// M: batch size
+// N: neurons
+// return:
+// merge_idx: groups * neurons * sizeof(int)
+// act_neurons: number of active neurons
+static void get_idx_cuda(const float * idx, int * merge_idx, int * act_neurons_device, const int M, const int N, cudaStream_t stream0) {
+    const int groups = M / SPARSITY_GROUP_SIZE;
+    const int len = N / WARP_SIZE;
+    const int total_bits = len * groups;
+
+    uint32_t *bits = nullptr, *prefix = nullptr;
+    size_t bits_size = 0, prefix_size = 0;
+
+    bits = (uint32_t*)ggml_cuda_pool_malloc(sizeof(uint32_t) * N / WARP_SIZE * groups, &bits_size);
+    prefix = (uint32_t*)ggml_cuda_pool_malloc(sizeof(uint32_t) * N / WARP_SIZE * groups, &prefix_size);
+
+    {
+        const int block_size = 4 * WARP_SIZE;
+        const int block_num_x = (N + block_size - 1) / block_size;
+        // printf("1、block_num_x: %d\n", block_num_x);
+
+        const dim3 block_nums(block_num_x, 1, 1);
+        const dim3 block_dims(block_size, 1, 1);
+        merge_batch_sparsity_kernel<<<block_nums, block_dims, 0, stream0>>>(idx, bits, prefix, M, N, groups);
+    }
+
+    // prefix sum
+    void *d_temp_storage = nullptr;
+    size_t temp_storage_bytes = 0, temp_storage_as = 0;
+    cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, prefix, prefix, total_bits, stream0);
+    d_temp_storage = ggml_cuda_pool_malloc(temp_storage_bytes, &temp_storage_as);
+    cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, prefix, prefix, total_bits, stream0);
+ 
+    move_activation<<<1, groups, 0, stream0>>>(prefix, act_neurons_device, len);
+
+    {
+        const int block_size = 1 * WARP_SIZE;
+        const int block_num_x = (total_bits + block_size - 1) / block_size;
+        // printf("2、block_num_x: %d\n", block_num_x);
+
+        const dim3 block_nums(block_num_x, 1, 1);
+        const dim3 block_dims(block_size, 1, 1);
+        generate_indices_kernel<<<block_nums, block_dims, 0, stream0>>>(bits, prefix, merge_idx, total_bits, groups);
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream0));
+    ggml_cuda_pool_free(bits, bits_size);
+    ggml_cuda_pool_free(prefix, prefix_size);
+    ggml_cuda_pool_free(d_temp_storage, temp_storage_as);
+}
+
+static void up_mul_mat_cuda_sparse(const half* weight, const float* input, float* dst, int * merge_idx, const int M, const int N, const int K, const int * act_neurons_device, cudaStream_t stream) {
+    half* input_h = nullptr;
+    size_t input_as = 0;
+    input_h = (half*)ggml_cuda_pool_malloc(N * K * sizeof(half), &input_as);
+
+    convert_fp32_to_fp16_cuda(input, input_h, N * K, stream);
+
+    using MMconfig = SparseMMConfig<4, 1, 4, 1, 4>;
+    const int BN = MMconfig::BN;
+    const int BM = MMconfig::BM;
+    const int BK = MMconfig::BK;
+    const int BLOCK_WARPS = MMconfig::BLOCK_WARPS;
+
+    const int block_num_x = (N + BN - 1) / BN;
+    const int block_num_y = (M + BM - 1) / BM;
+
+    // printf("block_num_x: %d, block_num_y: %d, act_M: %d, batch_size: %d\n", block_num_x, block_num_y, act_M, N);
+    // printf("BN: %d, BM: %d, BK: %d, BLOCK_WARPS: %d\n", BN, BM, BK, BLOCK_WARPS);
+    
+    const dim3 block_nums(block_num_x, block_num_y, 1);
+    const dim3 block_dims(BLOCK_WARPS * WARP_SIZE, 1, 1);
+    
+    size_t shared_size = 2 * (BM * BK + BN * BK) * sizeof(half);
+
+    cudaFuncSetAttribute(mm_up<MMconfig>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_size);
+
+    // printf("shared_size: %zu KB\n", shared_size / 1024);
+    mm_up<MMconfig><<<block_nums, block_dims, shared_size, stream>>>(weight, input_h, dst, M, N, K, act_neurons_device, merge_idx);
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    ggml_cuda_pool_free(input_h, input_as);
+}
+
+static void gate_and_up_mul_mat_cuda_sparse(const half* gate_w, const half* up_w, const float* input, float* gate_dst, float* up_dst, int * merge_idx, const int M, const int N, const int K, const int * act_neurons_device, cudaStream_t stream0, cudaStream_t stream1) {
+    half* input_h = nullptr;
+    size_t input_as = 0;
+    input_h = (half*)ggml_cuda_pool_malloc(N * K * sizeof(half), &input_as);
+
+    convert_fp32_to_fp16_cuda(input, input_h, N * K, stream0);
+
+    using MMconfig = SparseMMConfig<4, 1, 4, 1, 4>;
+    const int BN = MMconfig::BN;
+    const int BM = MMconfig::BM;
+    const int BK = MMconfig::BK;
+    const int BLOCK_WARPS = MMconfig::BLOCK_WARPS;
+
+    const int block_num_x = (N + BN - 1) / BN;
+    const int block_num_y = (M + BM - 1) / BM;
+
+    // printf("block_num_x: %d, block_num_y: %d, act_M: %d, batch_size: %d\n", block_num_x, block_num_y, act_M, N);
+    // printf("BN: %d, BM: %d, BK: %d, BLOCK_WARPS: %d\n", BN, BM, BK, BLOCK_WARPS);
+    
+    const dim3 block_nums(block_num_x, block_num_y, 1);
+    const dim3 block_dims(BLOCK_WARPS * WARP_SIZE, 1, 1);
+    
+    size_t shared_size = 2 * (BM * BK + BN * BK) * sizeof(half);
+
+    cudaFuncSetAttribute(mm_up<MMconfig>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_size);
+
+    // printf("shared_size: %zu KB\n", shared_size / 1024);
+
+    // CUDA_CHECK(cudaStreamSynchronize(stream0));
+    // test_mem<<<1,1,0,stream0>>>(merge_idx, M * block_num_x);
+    // CUDA_CHECK(cudaStreamSynchronize(stream0));
+
+    // gate
+    mm_up<MMconfig><<<block_nums, block_dims, shared_size, stream0>>> \
+    (gate_w, input_h, gate_dst, M, N, K, act_neurons_device, merge_idx);
+    // up
+    mm_up<MMconfig><<<block_nums, block_dims, shared_size, stream1>>> \
+    (up_w, input_h, up_dst, M, N, K, act_neurons_device, merge_idx);
+
+    // CUDA_CHECK(cudaStreamSynchronize(stream0));
+    CUDA_CHECK(cudaStreamSynchronize(stream1));
+    ggml_cuda_pool_free(input_h, input_as);
+}
+
+static void down_mul_mat_cuda_sparse(const half* weight, const float* input, float* dst, const int * merge_idx, const int M, const int N, const int K, const int * act_neurons_device, cudaStream_t stream) {
+    half* input_h = nullptr;
+    size_t input_as = 0;
+    input_h = (half*)ggml_cuda_pool_malloc(N * K * sizeof(half), &input_as);
+
+    convert_fp32_to_fp16_cuda(input, input_h, N * K, stream);
+
+    using MMconfig = SparseMMConfig<4, 1, 4, 1, 4>;
+    const int BN = MMconfig::BN;
+    const int BM = MMconfig::BM;
+    const int BK = MMconfig::BK;
+    const int BLOCK_WARPS = MMconfig::BLOCK_WARPS;
+
+    const int block_num_x = (N + BN - 1) / BN;
+    const int block_num_y = (M + BM - 1) / BM;
+
+    // printf("block_num_x: %d, block_num_y: %d, act_K: %d, batch_size: %d\n", block_num_x, block_num_y, act_K, N);
+    // printf("BN: %d, BM: %d, BK: %d, BLOCK_WARPS: %d\n", BN, BM, BK, BLOCK_WARPS);
+    
+    const dim3 block_nums(block_num_x, block_num_y, 1);
+    const dim3 block_dims(BLOCK_WARPS * WARP_SIZE, 1, 1);
+    
+    size_t shared_size = 2 * (BM * BK + BK * BN) * sizeof(half);
+
+    cudaFuncSetAttribute(mm_down<MMconfig>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_size);
+
+    // printf("shared_size: %zu KB\n", shared_size / 1024);
+    mm_down<MMconfig><<<block_nums, block_dims, shared_size, stream>>>(weight, input_h, dst, M, N, K, act_neurons_device, merge_idx);
+    // CUDA_CHECK(cudaStreamSynchronize(stream));
+    ggml_cuda_pool_free(input_h, input_as);
+}
+
+static void relu_and_mul_cuda(const float * gate, const float* up, float * dst, const int M, const int N, cudaStream_t stream) {
+    const int num_blocks = ((M * N) + CUDA_RELU_MUL_BLOCK_SIZE - 1) / CUDA_RELU_MUL_BLOCK_SIZE;
+    relu_and_mul_f32<<<num_blocks, CUDA_RELU_MUL_BLOCK_SIZE, 0, stream>>>(gate, up, dst, M, N);
+}
+
+static void relu_relu_mul_cuda(const float * gate, const float* up, float * dst, const int M, const int N, cudaStream_t stream) {
+    const int num_blocks = ((M * N) + CUDA_RELU_MUL_BLOCK_SIZE - 1) / CUDA_RELU_MUL_BLOCK_SIZE;
+    relu_relu_mul_f32<<<num_blocks, CUDA_RELU_MUL_BLOCK_SIZE, 0, stream>>>(gate, up, dst, M, N);
+}
+
+void add_cuda_sparse(const float* a, const float* b, float* c, const int M, const int N, const int * act_neurons_device, const int * merge_idx, cudaStream_t stream) {
+    const int block_num_x = (N + GGML_CUDA_DMMV_X - 1) / GGML_CUDA_DMMV_X;
+    const int block_num_y = (M + SPARSITY_GROUP_SIZE - 1) / SPARSITY_GROUP_SIZE;
+
+    const dim3 block_nums(block_num_x, block_num_y, 1);
+    const dim3 block_dims(GGML_CUDA_DMMV_X, SPARSITY_GROUP_SIZE, 1);
+
+    if (merge_idx == nullptr) {
+        add_f32_nosparse<<<block_nums, block_dims, 0, stream>>>(a, b, c, M, N);
+    } else {
+        add_f32_sparse<<<block_nums, block_dims, 0, stream>>>(a, b, c, M, N, act_neurons_device, merge_idx);
+    }
+}
+
+inline void ggml_cuda_op_ffn_sparse(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
+    const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
+    const int64_t src1_padded_row_size, const cudaStream_t & stream) {
+    GGML_ASSERT(src0->type == GGML_TYPE_F16
+             && src1->type == GGML_TYPE_F32);
+
+    const float * input = (float*)ggml_cuda_get_tensor_data(src1);
+
+    const float * idx = nullptr;
+    int param = dst->op_params[0];
+    if (param == 1) {
+        GGML_ASSERT(dst->src[5]->type == GGML_TYPE_F32);
+        GGML_ASSERT(dst->src[5]->backend == GGML_BACKEND_GPU);
+        idx = (float*)ggml_cuda_get_tensor_data(dst->src[5]);
+    } else {
+        GGML_ASSERT(dst->src[4]->type == GGML_TYPE_F32);
+        GGML_ASSERT(dst->src[4]->backend == GGML_BACKEND_GPU);
+        idx = (float*)ggml_cuda_get_tensor_data(dst->src[4]);
+    }
+
+    const int M = src1->ne[1] * src1->ne[2] * src1->ne[3];
+    const int N = src0->ne[1];
+    const int K = src1->ne[0];
+    // printf("FFN sparse M: %d, N: %d, K: %d\n", M, N, K);
+    const int groups = M / SPARSITY_GROUP_SIZE;
+
+    int * merge_idx = nullptr, * act_neurons_device = nullptr;
+    size_t merge_idx_size = 0, act_neurons_size = 0;
+    merge_idx = (int*)ggml_cuda_pool_malloc(N * groups * sizeof(int), &merge_idx_size);
+    act_neurons_device = (int*)ggml_cuda_pool_malloc(groups * sizeof(int), &act_neurons_size);
+
+    const cudaStream_t stream0 = g_cudaStreams[g_main_device][0];
+    const cudaStream_t stream1 = g_cudaStreams[g_main_device][1];
+
+    get_idx_cuda(idx, merge_idx, act_neurons_device, M, N, stream0);
+
+    float* tmp_dst[4];
+    size_t dst_size[4];
+    for (int i = 0; i < 3; i++) {
+        tmp_dst[i] = (float*)ggml_cuda_pool_malloc(M * N * sizeof(float), &dst_size[i]);
+    }
+
+    const half* gate_w  = nullptr;
+    const half* up_w = nullptr;
+    const float* up_b = nullptr;
+    const half* down_w = nullptr;
+    const float* down_b = nullptr;
+    if (param == 1) { // for OPT 
+        tmp_dst[3] = (float*)ggml_cuda_pool_malloc(M * K * sizeof(float), &dst_size[3]);
+        
+        // get data
+        up_w = (half*)ggml_cuda_get_tensor_data(dst->src[0]);
+        up_b = (float*)ggml_cuda_get_tensor_data(dst->src[2]);
+        down_w = (half*)ggml_cuda_get_tensor_data(dst->src[3]);
+        down_b = (float*)ggml_cuda_get_tensor_data(dst->src[4]);
+        
+        // compute
+        up_mul_mat_cuda_sparse(up_w, input, tmp_dst[0], merge_idx, N, M, K, act_neurons_device, stream0);
+        add_cuda_sparse(tmp_dst[0], up_b, tmp_dst[1], M, N, act_neurons_device, merge_idx, stream0);
+        relu_f32_cuda(tmp_dst[1], tmp_dst[2], M * N, stream0);
+        down_mul_mat_cuda_sparse(down_w, tmp_dst[2], tmp_dst[3], merge_idx, K, M, N, act_neurons_device, stream);
+        add_cuda_sparse(tmp_dst[3], down_b, dst_dd_i, M, K, nullptr, nullptr, stream0);
+
+        // release
+        for (int i = 0; i < 4; i++) {
+            ggml_cuda_pool_free(tmp_dst[i], dst_size[i]);
+        }
+
+    } else { 
+        // get data
+        gate_w  = (half*)ggml_cuda_get_tensor_data(dst->src[0]);
+        up_w = (half*)ggml_cuda_get_tensor_data(dst->src[2]);
+        down_w = (half*)ggml_cuda_get_tensor_data(dst->src[3]);
+
+        // compute
+        gate_and_up_mul_mat_cuda_sparse(gate_w, up_w, input, tmp_dst[0], tmp_dst[1], merge_idx, N, M, K, act_neurons_device, stream0, stream1);
+        if (param == 2) { // LLM_FFN_PAR
+            relu_and_mul_cuda(tmp_dst[0], tmp_dst[1], tmp_dst[2], M, N, stream0);
+        } else { // LLM_FFN_SYN
+            relu_relu_mul_cuda(tmp_dst[0], tmp_dst[1], tmp_dst[2], M, N, stream0);
+        }
+        down_mul_mat_cuda_sparse(down_w, tmp_dst[2], dst_dd_i, merge_idx, K, M, N, act_neurons_device, stream0);
+
+        for (int i = 0; i < 3; i++) {
+            ggml_cuda_pool_free(tmp_dst[i], dst_size[i]);
+        }
+    }
+
+    ggml_cuda_pool_free(merge_idx, merge_idx_size);
+    ggml_cuda_pool_free(act_neurons_device, act_neurons_size);
+    (void) src1_ddf_i;
+    (void) src1_ddq_i;
+    (void) src1_ncols;
+    (void) src1_padded_row_size;
+    (void) row_low;
+    (void) row_high;
+    (void) src0_dd_i;
+    (void) stream;
+}
+
 inline void ggml_cuda_op_mul_mat_cublas(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
@@ -8813,6 +9707,12 @@ void ggml_cuda_axpy(const ggml_tensor * src0, const ggml_tensor * src1, ggml_ten
     }
 }
 
+void ggml_cuda_ffn_sparse(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(dst->src[2] != NULL && dst->src[3] && dst->src[4] && "dst->src[2] must be present for ffn_sparse");
+    ggml_cuda_op_mul_mat(src0, src1, dst, ggml_cuda_op_ffn_sparse, false);
+
+}
+
 static void ggml_cuda_scale(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     ggml_cuda_op_flatten(src0, src1, dst, ggml_cuda_op_scale);
 }
@@ -9237,6 +10137,7 @@ bool ggml_cuda_compute_forward(struct ggml_compute_params * params, struct ggml_
             return false;
         }
     }
+    // auto start = ggml_time_us();
 
     switch (tensor->op) {
         case GGML_OP_REPEAT:
@@ -9288,6 +10189,9 @@ bool ggml_cuda_compute_forward(struct ggml_compute_params * params, struct ggml_
             break;
         case GGML_OP_AXPY:
             func = ggml_cuda_axpy;
+            break;
+        case GGML_OP_FFN_SPARSE:
+            func = ggml_cuda_ffn_sparse;
             break;
         case GGML_OP_SCALE:
             func = ggml_cuda_scale;
@@ -9341,6 +10245,8 @@ bool ggml_cuda_compute_forward(struct ggml_compute_params * params, struct ggml_
     func(tensor->src[0], tensor->src[1], tensor);
 
     // CUDA_CHECK(cudaDeviceSynchronize());
+    // auto end = ggml_time_us();
+    // printf("%s: %s in %f ms\n", __func__, tensor->name, (end - start)/1000.0);
 
     return true;
 }
