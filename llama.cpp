@@ -657,7 +657,9 @@ enum tensor_offloading_levels {
 
 tensor_offloading_levels get_offloading_level(llm_tensor tensor) {
     switch (tensor) {
-        case LLM_TENSOR_TOKEN_EMBD: case LLM_TENSOR_TOKEN_EMBD_NORM: case LLM_TENSOR_POS_EMBD: 
+        case LLM_TENSOR_TOKEN_EMBD: 
+            return TENSOR_OFFLOAD_OUTPUT;
+        case LLM_TENSOR_TOKEN_EMBD_NORM: case LLM_TENSOR_POS_EMBD: 
         case LLM_TENSOR_ROPE_FREQS:
             return TENSOR_NO_OFFLOAD;
         case LLM_TENSOR_OUTPUT: case LLM_TENSOR_OUTPUT_NORM:
@@ -4690,14 +4692,29 @@ static struct ggml_tensor * llm_build_ffn_sparse(
     };
 
     // prepare sparse idx
-    ggml_tensor * idx = ggml_mul_mat(ctx, pre_w1, pred_inpl);
-    cb(idx, "mlp_pre_hidden");
-    idx = ggml_relu(ctx, idx);
-    cb(idx, "mlp_pre_relu");
-    idx = ggml_mul_mat(ctx, pre_w2, idx);
-    // If the FFN layer is not fully offloaded, we need to transfer the sparsity index
-    // back to the CPU to avoid synchronization issues.
-    (full_gpu ? cb : cb_outer)(idx, "mlp_pre_out");
+    ggml_tensor * idx = nullptr;
+    // if (pre_w1->ne[1] < up->ne[1]) {
+    if (gate) {
+        idx = ggml_mul_mat(ctx, pre_w1, pred_inpl);
+        cb(idx, "mlp_pre_hidden");
+        idx = ggml_relu(ctx, idx);
+        cb(idx, "mlp_pre_relu");
+        idx = ggml_mul_mat(ctx, pre_w2, idx);
+    } else {
+        idx = ggml_mul_mat(ctx, up, cur);
+    }
+
+    if (idx != nullptr) {
+        // If the FFN layer is not fully offloaded, we need to transfer the sparsity index
+        // back to the CPU to avoid synchronization issues.
+        (full_gpu ? cb : cb_outer)(idx, "mlp_pre_out");
+    }
+
+    if (full_gpu && cur->ne[1] % 8 == 0) {
+        cur = ggml_ffn_sparse(ctx, cur, gate, gate_b, up, up_b, down_t, down_b, idx, type_gate);
+        cb(cur, "ffn_sparse_full_gpu");
+        return cur;
+    }
 
     auto act_fn = [&](ggml_tensor * tensor, const char * name) {
         switch (type_op) {
@@ -4711,12 +4728,6 @@ static struct ggml_tensor * llm_build_ffn_sparse(
         }
         return tensor;
     };
-
-    if (full_gpu && idx->ne[1] % 8 == 0) {
-        cur = ggml_ffn_sparse(ctx, cur, gate, gate_b, up, up_b, down_t, down_b, idx, type_gate);
-        cb(cur, "ffn_sparse_full_gpu");
-        return cur;
-    }
 
     // FFN up
     struct ggml_tensor * up_out = llm_build_sparse_mul_mat(ctx, up, ffn_input, idx, up_gpu, gpu_index, gpu_bucket, cb_outer, "up", full_gpu);

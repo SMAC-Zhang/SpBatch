@@ -7665,7 +7665,7 @@ inline void ggml_cuda_op_dequantize_axpy(
 // Sparse division related
 #define CUDA_RELU_MUL_BLOCK_SIZE 256
 #define SPARSITY_GROUP_SIZE 8
-#define MAX_GROUPS 64
+#define MAX_GROUPS 32
 
 // WMMA API parameters
 #define MMA_M 16
@@ -7942,7 +7942,7 @@ static __device__ __forceinline__ void LD_COL_FRAG_X2(uint32_t (* __restrict__ r
 }
 
 /*************************** cuda kernels ***************************/
-static __global__ void relu_and_mul_f32(const float * x, const float * y, float * dst, const int M, const int N) {
+static __global__ void relu_and_mul_f32(const float * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst, const int M, const int N) {
     const int i = blockDim.x*blockIdx.x + threadIdx.x;
 
     if (i >= M * N) {
@@ -7951,13 +7951,22 @@ static __global__ void relu_and_mul_f32(const float * x, const float * y, float 
     dst[i] = fmaxf(x[i], 0) * y[i];
 }
 
-static __global__ void relu_relu_mul_f32(const float * x, const float * y, float * dst, const int M, const int N) {
+static __global__ void relu_relu_mul_f32(const float * __restrict__ x, const float * __restrict__  y, float * __restrict__ dst, const int M, const int N) {
     const int i = blockDim.x*blockIdx.x + threadIdx.x;
 
     if (i >= M * N) {
         return;
     }
     dst[i] = fmaxf(x[i], 0) * fmaxf(y[i], 0);
+}
+
+static __global__ void relu_f16_f32(const half * __restrict__ x, float * __restrict__ dst, const int M, const int N) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= M * N) {
+        return;
+    }
+    dst[i] = fmax(__half2float(x[i]), 0.0f);
 }
 
 static __global__ void merge_batch_sparsity_kernel(const float * __restrict__ x, uint32_t * __restrict__ bits, uint32_t * __restrict__ prefix, const int batch_size, const int N, const int groups) {
@@ -8453,6 +8462,105 @@ void add_cuda_sparse(const float* a, const float* b, float* c, const int M, cons
     }
 }
 
+inline void ggml_cuda_op_ffn_nosparse(const float* input, const half* gate_w, const half* up_w, const float* up_b, const half* down_w, const float* down_b, float * dst_dd_i, const int M, const int N, const int K, const int param, cudaStream_t stream) {
+    half* input_h = nullptr;
+    size_t input_as = 0;
+    input_h = (half*)ggml_cuda_pool_malloc(M * K * sizeof(half), &input_as);
+    convert_fp32_to_fp16_cuda(input, input_h, M * K, stream);
+
+    float* tmp_dst[4];
+    size_t dst_size[4];
+    for (int i = 0; i < 3; i++) {
+        tmp_dst[i] = (float*)ggml_cuda_pool_malloc(M * N * sizeof(float), &dst_size[i]);
+    }
+    tmp_dst[3] = (float*)ggml_cuda_pool_malloc(M * K * sizeof(float), &dst_size[3]);
+
+    int id;
+    CUDA_CHECK(cudaGetDevice(&id));
+    auto handle = g_cublas_handles[id];
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+    
+    {// up
+        half* up_dst = nullptr;
+        size_t up_dst_size = 0;
+        up_dst = (half*)ggml_cuda_pool_malloc(M * N * sizeof(half), &up_dst_size);
+        const half alpha = 1.0f;
+        const half beta = 0.0f;
+        CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, \
+            N, M, K, &alpha, up_w, CUDA_R_16F, K, \
+            input_h, CUDA_R_16F, K, &beta, \
+            up_dst, CUDA_R_16F, N, \
+            CUBLAS_COMPUTE_16F, \
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+        if (up_b != nullptr) {
+            float* up_b_src = nullptr;
+            size_t up_b_src_size = 0;
+            up_b_src = (float*)ggml_cuda_pool_malloc(M * N * sizeof(float), &up_b_src_size);
+            convert_fp16_to_fp32_cuda(up_dst, up_b_src, M * N, stream);
+            add_cuda_sparse(up_b_src, up_b, tmp_dst[0], M, N, nullptr, nullptr, stream);
+            ggml_cuda_pool_free(up_b_src, up_b_src_size);
+        } else {
+            convert_fp16_to_fp32_cuda(up_dst, tmp_dst[0], M * N, stream); 
+        }
+        ggml_cuda_pool_free(up_dst, up_dst_size);
+
+        if (param == 3) { // ACT_SYM
+            relu_f32_cuda(tmp_dst[0], tmp_dst[0], M * N, stream);
+        }
+    }
+    
+    if (gate_w != nullptr) {
+        half* gate_dst = nullptr;
+        size_t gate_dst_size = 0;
+        gate_dst = (half*)ggml_cuda_pool_malloc(M * N * sizeof(half), &gate_dst_size);
+        const half alpha = 1.0f;
+        const half beta = 0.0f;
+        CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, \
+            N, M, K, &alpha, gate_w, CUDA_R_16F, K, \
+            input_h, CUDA_R_16F, K, &beta, \
+            gate_dst, CUDA_R_16F, N, \
+            CUBLAS_COMPUTE_16F, \
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        convert_fp16_to_fp32_cuda(gate_dst, tmp_dst[1], M * N, stream);
+        relu_and_mul_cuda(tmp_dst[1], tmp_dst[0], tmp_dst[2], M, N, stream);
+        ggml_cuda_pool_free(gate_dst, gate_dst_size);
+    }
+
+    ggml_cuda_pool_free(input_h, input_as);
+    
+    {// down
+        half* down_dst = nullptr, *down_src = nullptr;
+        size_t down_dst_size = 0, down_src_size = 0;
+        down_src = (half*)ggml_cuda_pool_malloc(M * N * sizeof(half), &down_src_size);
+        down_dst = (half*)ggml_cuda_pool_malloc(M * K * sizeof(half), &down_dst_size);
+        convert_fp32_to_fp16_cuda(gate_w ? tmp_dst[2]: tmp_dst[0], down_src, M * N, stream);
+        const half alpha = 1.0f;
+        const half beta = 0.0f;
+        CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, \
+            K, M, N, &alpha, down_w, CUDA_R_16F, K, \
+            down_src, CUDA_R_16F, N, &beta, \
+            down_dst, CUDA_R_16F, K, \
+            CUBLAS_COMPUTE_16F, \
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        if (down_b) {
+            convert_fp16_to_fp32_cuda(down_dst, tmp_dst[3], M * K, stream);
+            add_cuda_sparse(tmp_dst[3], down_b, dst_dd_i, M, K, nullptr, nullptr, stream);
+        } else {
+            convert_fp16_to_fp32_cuda(down_dst, dst_dd_i, M * K, stream);
+        }
+        ggml_cuda_pool_free(down_dst, down_dst_size);
+        ggml_cuda_pool_free(down_src, down_src_size);
+    }
+
+    for (int i = 0; i < 4; i++) {
+        ggml_cuda_pool_free(tmp_dst[i], dst_size[i]);
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return;
+}
+
 inline void ggml_cuda_op_ffn_sparse(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, const cudaStream_t & stream) {
@@ -8462,20 +8570,46 @@ inline void ggml_cuda_op_ffn_sparse(const ggml_tensor * src0, const ggml_tensor 
     const float * input = (float*)ggml_cuda_get_tensor_data(src1);
 
     const float * idx = nullptr;
+    const half* gate_w  = nullptr;
+    const half* up_w = nullptr;
+    const float* up_b = nullptr;
+    const half* down_w = nullptr;
+    const float* down_b = nullptr;
+
+
     int param = dst->op_params[0];
     if (param == 1) {
-        GGML_ASSERT(dst->src[5]->type == GGML_TYPE_F32);
-        GGML_ASSERT(dst->src[5]->backend == GGML_BACKEND_GPU);
-        idx = (float*)ggml_cuda_get_tensor_data(dst->src[5]);
+        // GGML_ASSERT(dst->src[5]->type == GGML_TYPE_F32);
+        // GGML_ASSERT(dst->src[5]->backend == GGML_BACKEND_GPU);
+        if (dst->src[5] != nullptr) {
+            idx = (float*)ggml_cuda_get_tensor_data(dst->src[5]);
+        }
+        // get data
+        up_w = (half*)ggml_cuda_get_tensor_data(dst->src[0]);
+        up_b = (float*)ggml_cuda_get_tensor_data(dst->src[2]);
+        down_w = (half*)ggml_cuda_get_tensor_data(dst->src[3]);
+        down_b = (float*)ggml_cuda_get_tensor_data(dst->src[4]);
     } else {
-        GGML_ASSERT(dst->src[4]->type == GGML_TYPE_F32);
-        GGML_ASSERT(dst->src[4]->backend == GGML_BACKEND_GPU);
-        idx = (float*)ggml_cuda_get_tensor_data(dst->src[4]);
+        // GGML_ASSERT(dst->src[4]->type == GGML_TYPE_F32);
+        // GGML_ASSERT(dst->src[4]->backend == GGML_BACKEND_GPU);
+        if (dst->src[4] != nullptr) {
+            idx = (float*)ggml_cuda_get_tensor_data(dst->src[4]);
+        }
+        // get data
+        gate_w  = (half*)ggml_cuda_get_tensor_data(dst->src[0]);
+        up_w = (half*)ggml_cuda_get_tensor_data(dst->src[2]);
+        down_w = (half*)ggml_cuda_get_tensor_data(dst->src[3]);
     }
 
     const int M = src1->ne[1] * src1->ne[2] * src1->ne[3];
     const int N = src0->ne[1];
     const int K = src1->ne[0];
+
+    if (idx == nullptr) { // fallback to dense ffn
+        ggml_cuda_op_ffn_nosparse(input, gate_w, up_w, up_b, down_w, down_b, dst_dd_i, M, N, K, param, stream);
+        return;
+    }
+
     // printf("FFN sparse M: %d, N: %d, K: %d\n", M, N, K);
     const int groups = M / SPARSITY_GROUP_SIZE;
 
@@ -8495,19 +8629,8 @@ inline void ggml_cuda_op_ffn_sparse(const ggml_tensor * src0, const ggml_tensor 
         tmp_dst[i] = (float*)ggml_cuda_pool_malloc(M * N * sizeof(float), &dst_size[i]);
     }
 
-    const half* gate_w  = nullptr;
-    const half* up_w = nullptr;
-    const float* up_b = nullptr;
-    const half* down_w = nullptr;
-    const float* down_b = nullptr;
     if (param == 1) { // for OPT 
         tmp_dst[3] = (float*)ggml_cuda_pool_malloc(M * K * sizeof(float), &dst_size[3]);
-        
-        // get data
-        up_w = (half*)ggml_cuda_get_tensor_data(dst->src[0]);
-        up_b = (float*)ggml_cuda_get_tensor_data(dst->src[2]);
-        down_w = (half*)ggml_cuda_get_tensor_data(dst->src[3]);
-        down_b = (float*)ggml_cuda_get_tensor_data(dst->src[4]);
         
         // compute
         up_mul_mat_cuda_sparse(up_w, input, tmp_dst[0], merge_idx, N, M, K, act_neurons_device, stream0);
@@ -8521,12 +8644,7 @@ inline void ggml_cuda_op_ffn_sparse(const ggml_tensor * src0, const ggml_tensor 
             ggml_cuda_pool_free(tmp_dst[i], dst_size[i]);
         }
 
-    } else { 
-        // get data
-        gate_w  = (half*)ggml_cuda_get_tensor_data(dst->src[0]);
-        up_w = (half*)ggml_cuda_get_tensor_data(dst->src[2]);
-        down_w = (half*)ggml_cuda_get_tensor_data(dst->src[3]);
-
+    } else { // for llama and bamboo
         // compute
         gate_and_up_mul_mat_cuda_sparse(gate_w, up_w, input, tmp_dst[0], tmp_dst[1], merge_idx, N, M, K, act_neurons_device, stream0, stream1);
         if (param == 2) { // LLM_FFN_PAR
