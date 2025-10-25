@@ -4210,12 +4210,19 @@ struct ggml_tensor * ggml_ffn_sparse(
     result->op = GGML_OP_FFN_SPARSE;
     result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
     if (ffn_gate_type == 0) {
-        result->src[0] = up_w;
-        result->src[1] = input;
-        result->src[2] = up_b;
-        result->src[3] = down_w;
-        result->src[4] = down_b;
-        result->src[5] = idx;
+        if (!up_b) {
+            result->src[0] = up_w;
+            result->src[1] = input;
+            result->src[2] = down_w;
+            result->src[3] = idx;
+        } else {
+            result->src[0] = up_w;
+            result->src[1] = input;
+            result->src[2] = up_b;
+            result->src[3] = down_w;
+            result->src[4] = down_b;
+            result->src[5] = idx;
+        }
     } else if (ffn_gate_type == 1 || ffn_gate_type == 2) {
         result->src[0] = gate_w;
         result->src[1] = input;
@@ -4227,6 +4234,9 @@ struct ggml_tensor * ggml_ffn_sparse(
     }
 
     int32_t params[] = { ffn_gate_type + 1 };
+    if (!up_b && !gate_w) {
+        params[0] = 4; // falcon
+    }
     ggml_set_op_params(result, params, sizeof(params));
 
     (void)gate_b;

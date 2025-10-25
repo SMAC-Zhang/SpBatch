@@ -8564,21 +8564,26 @@ inline void ggml_cuda_op_ffn_nosparse(const float* input, const half* gate_w, co
 inline void ggml_cuda_op_ffn_sparse(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, const cudaStream_t & stream) {
-    GGML_ASSERT(src0->type == GGML_TYPE_F16
-             && src1->type == GGML_TYPE_F32);
+    // GGML_ASSERT(src0->type == GGML_TYPE_F16
+    //          && src1->type == GGML_TYPE_F32);
 
     const float * input = (float*)ggml_cuda_get_tensor_data(src1);
 
     const float * idx = nullptr;
     const half* gate_w  = nullptr;
-    const half* up_w = nullptr;
+    half* up_w = nullptr;
     const float* up_b = nullptr;
-    const half* down_w = nullptr;
+    half* down_w = nullptr;
     const float* down_b = nullptr;
+    size_t up_w_size = 0;
+    size_t down_w_size = 0;
 
+    const int M = src1->ne[1] * src1->ne[2] * src1->ne[3];
+    const int N = src0->ne[1];
+    const int K = src1->ne[0];
 
     int param = dst->op_params[0];
-    if (param == 1) {
+    if (param == 1) { // for OPT
         // GGML_ASSERT(dst->src[5]->type == GGML_TYPE_F32);
         // GGML_ASSERT(dst->src[5]->backend == GGML_BACKEND_GPU);
         if (dst->src[5] != nullptr) {
@@ -8589,7 +8594,25 @@ inline void ggml_cuda_op_ffn_sparse(const ggml_tensor * src0, const ggml_tensor 
         up_b = (float*)ggml_cuda_get_tensor_data(dst->src[2]);
         down_w = (half*)ggml_cuda_get_tensor_data(dst->src[3]);
         down_b = (float*)ggml_cuda_get_tensor_data(dst->src[4]);
-    } else {
+    } else if (param == 4) { // for falcon
+        if (dst->src[3] != nullptr) {
+            idx = (float*)ggml_cuda_get_tensor_data(dst->src[3]);
+        }
+        if (dst->src[0]->type != GGML_TYPE_F16) {
+            up_w = (half*)ggml_cuda_pool_malloc(K * N * sizeof(half), &up_w_size);
+            const to_fp16_cuda_t to_fp16_cuda = ggml_get_to_fp16_cuda(dst->src[0]->type);
+            to_fp16_cuda((void*)ggml_cuda_get_tensor_data(dst->src[0]), up_w, K * N, stream);
+        } else {
+            up_w = (half*)ggml_cuda_get_tensor_data(dst->src[0]);
+        }
+        if (dst->src[2]->type != GGML_TYPE_F16) {
+            down_w = (half*)ggml_cuda_pool_malloc(K * N * sizeof(half), &down_w_size);
+            const to_fp16_cuda_t to_fp16_cuda = ggml_get_to_fp16_cuda(dst->src[2]->type);
+            to_fp16_cuda((void*)ggml_cuda_get_tensor_data(dst->src[2]), down_w, K * N, stream);
+        } else {
+            down_w = (half*)ggml_cuda_get_tensor_data(dst->src[2]);
+        }
+    } else { // for llama and bamboo
         // GGML_ASSERT(dst->src[4]->type == GGML_TYPE_F32);
         // GGML_ASSERT(dst->src[4]->backend == GGML_BACKEND_GPU);
         if (dst->src[4] != nullptr) {
@@ -8600,10 +8623,6 @@ inline void ggml_cuda_op_ffn_sparse(const ggml_tensor * src0, const ggml_tensor 
         up_w = (half*)ggml_cuda_get_tensor_data(dst->src[2]);
         down_w = (half*)ggml_cuda_get_tensor_data(dst->src[3]);
     }
-
-    const int M = src1->ne[1] * src1->ne[2] * src1->ne[3];
-    const int N = src0->ne[1];
-    const int K = src1->ne[0];
 
     if (idx == nullptr) { // fallback to dense ffn
         ggml_cuda_op_ffn_nosparse(input, gate_w, up_w, up_b, down_w, down_b, dst_dd_i, M, N, K, param, stream);
@@ -8642,6 +8661,22 @@ inline void ggml_cuda_op_ffn_sparse(const ggml_tensor * src0, const ggml_tensor 
         // release
         for (int i = 0; i < 4; i++) {
             ggml_cuda_pool_free(tmp_dst[i], dst_size[i]);
+        }
+
+    } else if (param == 4) { // for falcon
+        // compute
+        up_mul_mat_cuda_sparse(up_w, input, tmp_dst[0], merge_idx, N, M, K, act_neurons_device, stream0);
+        relu_f32_cuda(tmp_dst[0], tmp_dst[1], M * N, stream0);
+        down_mul_mat_cuda_sparse(down_w, tmp_dst[1], dst_dd_i, merge_idx, K, M, N, act_neurons_device, stream0);
+
+        for (int i = 0; i < 3; i++) {
+            ggml_cuda_pool_free(tmp_dst[i], dst_size[i]);
+        }
+        if (down_w_size > 0) {
+            ggml_cuda_pool_free(down_w, down_w_size);
+        }
+        if (up_w_size > 0) {
+            ggml_cuda_pool_free(up_w, up_w_size);
         }
 
     } else { // for llama and bamboo
@@ -9826,7 +9861,7 @@ void ggml_cuda_axpy(const ggml_tensor * src0, const ggml_tensor * src1, ggml_ten
 }
 
 void ggml_cuda_ffn_sparse(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_ASSERT(dst->src[2] != NULL && dst->src[3] && dst->src[4] && "dst->src[2] must be present for ffn_sparse");
+    GGML_ASSERT(dst->src[2] != NULL && dst->src[3] && "dst->src[2] must be present for ffn_sparse");
     ggml_cuda_op_mul_mat(src0, src1, dst, ggml_cuda_op_ffn_sparse, false);
 
 }
