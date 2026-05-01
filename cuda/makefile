@@ -35,7 +35,25 @@ ffn_test.o: ffn_test.cu utility.cuh kernel.cuh
 ffn_test: utility.o kernel.o ffn_test.o
 	$(NVCC) $(NVCCFLAGS) $(CUBLASFLAGS) $^ -o $@
 
-all: gemm_test sparsity_test spmm_test ffn_test
+quantize_test.o: quantize_test.cu utility.cuh kernel.cuh
+	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+
+quantize_test: utility.o kernel.o quantize_test.o
+	$(NVCC) $(NVCCFLAGS) $(CUBLASFLAGS) $^ -o $@
+
+dequantize_test.o: dequantize_test.cu utility.cuh kernel.cuh
+	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+
+dequantize_test: utility.o kernel.o dequantize_test.o
+	$(NVCC) $(NVCCFLAGS) $(CUBLASFLAGS) $^ -o $@
+
+spdeq_test.o: spdeq_test.cu kernel.cuh
+	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+
+spdeq_test: utility.o kernel.o spdeq_test.o
+	$(NVCC) $(NVCCFLAGS) $(CUBLASFLAGS) $^ -o $@
+
+all: gemm_test sparsity_test spmm_test ffn_test quantize_test dequantize_test spdeq_test
 
 clean:
-	rm -f *.o gemm_test sparsity_test spmm_test ffn_test
+	rm -f *.o gemm_test sparsity_test spmm_test ffn_test quantize_test dequantize_test spdeq_test

@@ -63,6 +63,14 @@
 #define SWIZZLE_UNIT 8
 #define HALF_PER_FLOAT4 8
 
+#define QK4_0 32
+#define QR4_0 2
+#define QI4_0 (QK4_0 / (4 * QR4_0))
+typedef struct {
+    half    d;              // delta
+    uint8_t qs[QK4_0 / 2];  // nibbles / quants
+} block_q4_0;
+
 
 typedef float dfloat; // dequantize float
 typedef float2 dfloat2;
@@ -91,15 +99,20 @@ struct SparseMMConfig {
 
 void convert_fp32_to_fp16_cuda(const void * vx, half * y, const int k, cudaStream_t stream);
 void convert_fp16_to_fp32_cuda(const void * vx, float * y, const int k, cudaStream_t stream);
+void dequantize_q4_0_full_cuda(const void * vx, half * y, const int k, cudaStream_t stream);
+void dequantize_row_q4_0_sparse_cuda(const void * vx, half * y, const int rows, const int cols, const int * merge_idx, const int * act_neurons_device, const int groups, cudaStream_t stream);
+void dequantize_row_q4_0_sparse_unique_cuda(const void * vx, half * y, const int rows, const int cols, const int * unique_idx, const int * unique_neurons_device, cudaStream_t stream);
 void convert_mul_mat_batch_f16_cuda_sparse(const void * vx, const dfloat * y, float * dst, const int ncols, const int nrows, int src1_ncols, int dst_ne0, cudaStream_t stream, int *lst, float *idx);
 void convert_axpy_sparse_batch_f16_cuda(const void * vx, const dfloat * y, float * dst, const int ncols, const int nrows, int src1_rows, int src1_ncols, cudaStream_t stream, int *lst, float *idx);
+void dequantize_mul_mat_batch_q4_0_cuda_sparse(const void * vx, const dfloat * y, float * dst, const int ncols, const int nrows, int src1_ncols, int dst_ne0, cudaStream_t stream, int *lst, float *idx);
+void dequantize_axpy_sparse_batch_q4_0_cuda(const void * vx, const dfloat * y, float * dst, const int ncols, const int nrows, int src1_rows, int src1_ncols, cudaStream_t stream, int *lst, float *idx);
 void relu_f32_cuda(const float * x, float * dst, const int k, cudaStream_t stream);
 void mul_f32_cuda(const float * x, const float * y, float * dst, const int kx, const int ky, cudaStream_t stream);
 
 // parameters:
 // M: batch size
 // N: neurons
-void get_idx_cuda(const float * idx, int * merge_idx, int * act_neurons_device, const int M, const int N, cudaStream_t stream0);
+void get_idx_cuda(const float * idx, int * merge_idx, int * act_neurons_device, const int M, const int N, cudaStream_t stream0, int * unique_idx = nullptr, int * unique_neurons_device = nullptr);
 
 // parameters:
 // M: neurons
@@ -124,6 +137,13 @@ void relu_relu_mul_cuda(const float * gate, const float* up, float * dst, const 
 // N: batch size
 // K: neurons
 void down_mul_mat_cuda_sparse(const half* weight, const float* input, float* dst, int * merge_idx, const int M, const int N, const int K, const int * act_neurons_device, cudaStream_t stream);
+
+// quant_bits: 4 uses signed int4 packed two weights per byte; 8 uses int8_t.
+// scale is one fp16 value per original neuron row.
+void dequantize_mm_up_cuda_sparse(const void* weight, const half* scale, const float* input, float* dst, int * merge_idx, const int M, const int N, const int K, const int * act_neurons_device, const int quant_bits, cudaStream_t stream);
+void dequantize_mm_down_cuda_sparse(const void* weight, const half* scale, const float* input, float* dst, int * merge_idx, const int M, const int N, const int K, const int * act_neurons_device, const int quant_bits, cudaStream_t stream);
+void dequantize_up_mul_mat_cuda_sparse(const void* weight, const half* scale, const float* input, float* dst, int * merge_idx, const int M, const int N, const int K, const int * act_neurons_device, const int quant_bits, cudaStream_t stream);
+void dequantize_down_mul_mat_cuda_sparse(const void* weight, const half* scale, const float* input, float* dst, int * merge_idx, const int M, const int N, const int K, const int * act_neurons_device, const int quant_bits, cudaStream_t stream);
 
 void add_sparse_cuda(const float* a, const half* b, float* c, const int M, const int N, const int * act_neurons_device, const int * merge_idx, cudaStream_t stream);
 /*******************test gemm *************************/
