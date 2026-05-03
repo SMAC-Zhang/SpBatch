@@ -894,10 +894,16 @@ static __global__ void merge_batch_sparsity_kernel(const float * __restrict__ x,
 
     #pragma unroll
     for (int i = 0; i < groups; ++i) {
-        bits[i * len + wid] = __ballot_sync(0xFFFFFFFF, pred[i]);
+        const uint32_t word = __ballot_sync(0xFFFFFFFF, pred[i] != 0);
+        if (lane == 0) {
+            const int p = i * len + wid;
+            bits[p] = word;
+            prefix[p] = __popc(word);
+        }
     }
-    if (lane < groups) {
-        const int bits_pos = lane * len + wid;
+    #pragma unroll
+    for (int i = lane; i < groups; i += WARP_SIZE) {
+        const int bits_pos = i * len + wid;
         prefix[bits_pos] = __popc(bits[bits_pos]);
     }
 }
